@@ -48,7 +48,7 @@ spinner() {
 # =====================
 ARCH_RAW="$(uname -m)"
 case "$ARCH_RAW" in
-    x86_64) ARCH="x86_64" ;;
+    x86_64|amd64) ARCH="x86_64" ;;
     aarch64|arm64) ARCH="aarch64" ;;
     *) err "Arquitetura não suportada: $ARCH_RAW" ;;
 esac
@@ -65,9 +65,18 @@ for d in "${DEPS[@]}"; do
 done
 
 if [ "${#missing[@]}" -ne 0 ]; then
-    warn "Instalando dependências..."
-    (sudo dnf install -y curl jq pv >/dev/null 2>&1) &
-    spinner $! "Instalando pacotes..."
+    warn "Instalando dependências: ${missing[*]}"
+    if ! sudo -n true &>/dev/null; then
+        echo
+        err "Sem acesso sudo disponível (sem timestamp). Execute o script como root ou com sudo e tente novamente."
+    fi
+    if command -v dnf &>/dev/null; then
+        sudo dnf install -y "${missing[@]}" || err "Falha ao instalar as dependências (dnf)"
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -S --noconfirm "${missing[@]}" || err "Falha ao instalar as dependências (pacman)"
+    else
+        err "Gerenciador de pacotes não suportado. Instale manualmente: curl, jq e pv."
+    fi
     ok "Dependências prontas"
 else
     ok "Dependências OK"
@@ -80,35 +89,88 @@ FREEBUFF_DIR="$HOME/Freebuff"
 mkdir -p "$FREEBUFF_DIR"
 
 # =====================
-# Download direto
+# Download direto (AppImage x86_64)
 # =====================
 info "Buscando Freebuff..."
 
-DOWNLOAD_URL="https://freebuff.com/api/desktop/download/linux"
+case "$ARCH" in
+    x86_64) APPIMAGE_URL="https://freebuff.com/api/desktop/download/linux-appimage" ;;
+    aarch64) APPIMAGE_URL="https://freebuff.com/api/desktop/download/linux-arm64-appimage" ;;
+esac
 APPIMAGE="$FREEBUFF_DIR/Freebuff.AppImage"
+
+# Valida se o arquivo é um AppImage (ELF) da arquitetura esperada
+# retorno: 0 = OK | 1 = não é AppImage | 2 = AppImage, arquitetura errada (ou indefinida)
+check_appimage_arch() {
+    local f="$1" exp_arch magic emach
+    exp_arch="$2"
+    [[ -s "$f" ]] || return 1
+    magic="$(od -An -tx1 -N4 "$f" 2>/dev/null | tr -d ' \n')"
+    [[ "$magic" == "7f454c46" ]] || return 1
+    emach="$(od -An -tx1 -j18 -N2 "$f" 2>/dev/null | tr -d ' \n')"
+    [[ -n "$emach" ]] || return 1
+    case "$exp_arch" in
+        x86_64) [[ "$emach" == "3e00" ]] || return 2 ;;
+        aarch64) [[ "$emach" == "b700" ]] || return 2 ;;
+        *) return 2 ;;
+    esac
+    return 0
+}
+
+shopt -s nullglob
+
+# =====================
+# Limpeza de downloads anteriores
+# =====================
+for old in "$FREEBUFF_DIR"/*.deb; do
+    warn "Removendo .deb de instalação antiga: $(basename "$old")"
+    rm -f "$old"
+done
+
+for old in "$FREEBUFF_DIR"/*.AppImage; do
+    if check_appimage_arch "$old" "$ARCH"; then
+        continue
+    fi
+    warn "Removendo AppImage inválido/não $ARCH: $(basename "$old")"
+    rm -f "$old"
+done
 
 # =====================
 # Reinstalar
 # =====================
-if [[ -f "$APPIMAGE" ]]; then
-    warn "Já instalado"
+if [[ -f "$APPIMAGE" ]] && check_appimage_arch "$APPIMAGE" "$ARCH"; then
+    warn "Já instalado ($(basename "$APPIMAGE"))"
     read -p "Reinstalar? (y/n) " r
     [[ ! "$r" =~ ^[Yy]$ ]] && exit 0
 fi
+
+shopt -u nullglob
 
 # =====================
 # Download
 # =====================
 echo
-info "Baixando Freebuff..."
+info "Baixando Freebuff (AppImage $ARCH)..."
 
-curl -Ls "$DOWNLOAD_URL" -o - \
+TMP_DOWNLOAD="$(mktemp "$FREEBUFF_DIR/.freebuff-download.XXXXXX")"
+trap 'rm -f "$TMP_DOWNLOAD"' EXIT
+
+curl -Lfs "$APPIMAGE_URL" -o - \
 | pv -w 60 -p -t -e -r -b -F "%b %t [%r] [%40b]" \
-> "$APPIMAGE"
+> "$TMP_DOWNLOAD"
 
-chmod +x "$APPIMAGE"
+check_appimage_arch "$TMP_DOWNLOAD" "$ARCH"
+case $? in
+    0) : ;;
+    2) rm -f "$TMP_DOWNLOAD"; err "O download veio em arquitetura $ARCH (não $ARCH). Nada foi instalado." ;;
+    *) rm -f "$TMP_DOWNLOAD"; err "O arquivo baixado não é um AppImage válido. Nada foi instalado." ;;
+esac
+
+chmod +x "$TMP_DOWNLOAD"
+mv -f "$TMP_DOWNLOAD" "$APPIMAGE"
 echo
 ok "Download concluído"
+ok "Arquivo: $APPIMAGE (AppImage $ARCH)"
 
 # =====================
 # Wrapper (detecta AppImage mais recente)
